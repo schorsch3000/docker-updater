@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+export FC_DEFAULT='\e[39m'
+export FC_BLACK='\e[30m'
+export FC_RED='\e[31m'
+export FC_GREEN='\e[32m'
+export FC_YELLOW='\e[33m'
+export FC_BLUE='\e[34m'
+export FC_MAGENTA='\e[35m'
+export FC_CYAN='\e[36m'
+export FC_LIGHT_GRAY='\e[37m'
+export FC_DARK_GRAY='\e[90m'
+export FC_LIGHT_RED='\e[91m'
+export FC_LIGHT_GREEN='\e[92m'
+export FC_LIGHT_YELLOW='\e[93m'
+export FC_LIGHT_BLUE='\e[94m'
+export FC_LIGHT_MAGENTA='\e[95m'
+export FC_LIGHT_CYAN='\e[96m'
+export FC_WHITE='\e[97m'
+export BC_DEFAULT='\e[49m'
+export BC_BLACK='\e[40m'
+export BC_RED='\e[41m'
+export BC_GREEN='\e[42m'
+export BC_YELLOW='\e[43m'
+export BC_BLUE='\e[44m'
+export BC_MAGENTA='\e[45m'
+export BC_CYAN='\e[46m'
+export BC_LIGHT_GRAY='\e[47m'
+export BC_DARK_GRAY='\e[100m'
+export BC_LIGHT_RED='\e[101m'
+export BC_LIGHT_GREEN='\e[102m'
+export BC_LIGHT_YELLOW='\e[103m'
+export BC_LIGHT_BLUE='\e[104m'
+export BC_LIGHT_MAGENTA='\e[105m'
+export BC_LIGHT_CYAN='\e[106m'
+export BC_WHITE='\e[107m'
+export S_BOLD='\e[1m'
+export S_DIM='\e[2m'
+export S_UNDERLINED='\e[4m'
+export S_BLINK='\e[5m'
+export S_INV='\e[7m'
+export S_HIDDEN='\e[8m'
+export R_ALL='\e[0m'
+export R_BOLD='\e[21m'
+export R_DIM='\e[22m'
+export R_UNDERLINED='\e[24m'
+export R_BLINK='\e[24m'
+export R_INV='\e[27m'
+export R_HIDDEN='\e[28m'
+
+# No colors when output is not a terminal (cron mail, logs) or NO_COLOR is set.
+if [[ ! -t 1 || -n "$NO_COLOR" ]]; then
+	for v in $(compgen -v | grep -E '^(FC|BC|S|R)_[A-Z_]+$'); do
+		export "$v="
+	done
+fi
+
+# Replaced by the release workflow with the tag name.
+VERSION="dev"
+
+# File names docker compose looks for, in its order of precedence.
+COMPOSE_FILE_NAMES=(compose.yaml compose.yml docker-compose.yaml docker-compose.yml)
+
+usage() {
+	echo "
+usage: $0 [-n|--dry-run] [-r|--root DIR] [COMPOSE_FILE_OR_DIR...]
+
+update all docker compose projects in the root directory (default /opt/docker,
+can be set with \$DOCKER_UPDATER_ROOT or --root) that have autoupdate enabled.
+if compose files or project directories are given, only those are updated.
+
+autoupdate can be enabled by putting
+
+x-docker-updater:
+  enabled: true
+
+in the compose file (compose.yaml, compose.yml, docker-compose.yaml or docker-compose.yml)
+or in an override or included file. the old way, configs.autoupdate, still works but is deprecated.
+
+for each project: pull, build --pull, and if any image or the config changed,
+up -d --remove-orphans. docker system prune -af runs once before and once after all projects.
+
+  -n, --dry-run   change nothing, show which projects have updates available
+  -r, --root DIR  directory containing the compose projects
+  -V, --version   show version
+  -h, --help      show this help
+
+exits with 1 if anything failed.
+"
+}
+
+die() {
+	echo -e "${FC_LIGHT_RED}ERROR: ${FC_DEFAULT}$*" >&2
+	exit 1
+}
+
+ROOT="${DOCKER_UPDATER_ROOT:-/opt/docker}"
+DRY_RUN=0
+ARGS=()
+
+while (($#)); do
+	case "$1" in
+	-h | --help)
+		usage
+		exit 0
+		;;
+	-V | --version)
+		echo "docker-updater $VERSION"
+		exit 0
+		;;
+	-n | --dry-run) DRY_RUN=1 ;;
+	-r | --root)
+		[[ -n "$2" ]] || die "$1 needs a directory"
+		ROOT="$2"
+		shift
+		;;
+	--root=*) ROOT="${1#*=}" ;;
+	--)
+		shift
+		ARGS+=("$@")
+		break
+		;;
+	-*)
+		usage >&2
+		die "unknown option $1"
+		;;
+	*) ARGS+=("$1") ;;
+	esac
+	shift
+done
+
+command -v yq &>/dev/null || die "package yq is missing :-("
+command -v docker &>/dev/null || die "docker is missing"
+
+# Results for the summary, one entry per project.
+RES_NAME=()
+RES_STATUS=()
+RES_REASON=()
+FAILED=0
+
+record() {
+	RES_NAME+=("$1")
+	RES_STATUS+=("$2")
+	RES_REASON+=("$3${CUR_NOTE:+ ($CUR_NOTE)}")
+	[[ "$2" == failed ]] && FAILED=1
+}
+
+# Prints the compose file docker compose would use in directory $1.
+find_compose_file() {
+	local name
+	for name in "${COMPOSE_FILE_NAMES[@]}"; do
+		[[ -f "$1/$name" ]] && {
+			echo "$1/$name"
+			return 0
+		}
+	done
+	return 1
+}
+
+# Project candidates: directory, compose file, and extra compose args.
+P_DIR=()
+P_FILE=()
+P_FARG=()
+declare -A SEEN=()
+
+add_project() {
+	local dir="$1" file="$2" farg=""
+	# Only pass -f for a non-default file, otherwise override files would no longer be picked up.
+	[[ "$file" == "$(find_compose_file "$dir")" ]] || farg="$file"
+	[[ -n "${SEEN["$dir|$farg"]}" ]] && return
+	SEEN["$dir|$farg"]=1
+	P_DIR+=("$dir")
+	P_FILE+=("$file")
+	P_FARG+=("$farg")
+}
+
+if ((${#ARGS[@]})); then
+	for arg in "${ARGS[@]}"; do
+		if [[ -d "$arg" ]]; then
+			dir="$(realpath "$arg")"
+			if file="$(find_compose_file "$dir")"; then
+				add_project "$dir" "$file"
+			else
+				record "$(basename "$dir")" skipped "no compose file in $dir"
+			fi
+		elif [[ -f "$arg" ]]; then
+			file="$(realpath "$arg")"
+			add_project "$(dirname "$file")" "$file"
+		else
+			record "$arg" failed "not found"
+		fi
+	done
+else
+	[[ -d "$ROOT" ]] || die "root directory $ROOT does not exist"
+	for dir in "$ROOT"/*/; do
+		[[ -d "$dir" ]] || continue
+		dir="$(realpath "$dir")"
+		file="$(find_compose_file "$dir")" && add_project "$dir" "$file"
+	done
+fi
+
+# Runs docker compose for the current project (set by process_project).
+dc() {
+	if [[ -n "$CUR_FARG" ]]; then
+		docker compose -f "$CUR_FARG" "$@"
+	else
+		docker compose "$@"
+	fi
+}
+
+# Fills CHANGES with services whose container is missing, uses an old image, or has an old config.
+local_changes() {
+	CHANGES=()
+	local -A want_hash=() seen=() changed=()
+	local svc hash cid csvc chash ref cimg
+
+	while read -r svc hash; do
+		[[ -n "$svc" ]] && want_hash["$svc"]="$hash"
+	done < <(dc config --hash '*' 2>/dev/null)
+	((${#want_hash[@]})) || {
+		CHANGES=("can't read compose config")
+		return 1
+	}
+
+	while read -r cid; do
+		[[ -n "$cid" ]] || continue
+		IFS=$'\t' read -r csvc chash ref cimg < <(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}{{"\t"}}{{index .Config.Labels "com.docker.compose.config-hash"}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.Image}}' "$cid")
+		seen["$csvc"]=1
+		[[ -n "${want_hash["$csvc"]}" ]] || continue
+		if [[ "${want_hash["$csvc"]}" != "$chash" ]]; then
+			changed["$csvc"]="config changed"
+		elif [[ "$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null)" != "$cimg" ]]; then
+			changed["$csvc"]="new image"
+		fi
+	done < <(dc ps -aq)
+
+	for svc in "${!want_hash[@]}"; do
+		[[ -n "${seen["$svc"]}" ]] || changed["$svc"]="no container"
+	done
+	for svc in "${!changed[@]}"; do
+		CHANGES+=("$svc: ${changed["$svc"]}")
+	done
+	return 0
+}
+
+# Fills OUTDATED and UNCHECKED by comparing local image digests with the registry, without pulling.
+remote_changes() {
+	OUTDATED=()
+	UNCHECKED=()
+	local ref local_digests remote
+
+	while read -r ref; do
+		[[ -n "$ref" ]] || continue
+		if ! local_digests="$(docker image inspect -f '{{join .RepoDigests " "}}' "$ref" 2>/dev/null)"; then
+			OUTDATED+=("$ref: not present locally")
+			continue
+		fi
+		if [[ -z "$local_digests" ]]; then
+			UNCHECKED+=("$ref: local or built image")
+			continue
+		fi
+		if ((!HAVE_BUILDX)); then
+			UNCHECKED+=("$ref: docker buildx missing")
+			continue
+		fi
+		remote="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' 2>/dev/null | grep -o 'sha256:[0-9a-f]\{64\}' | head -n 1)"
+		if [[ -z "$remote" ]]; then
+			UNCHECKED+=("$ref: registry lookup failed")
+			continue
+		fi
+		[[ " $local_digests " == *"@$remote "* ]] || OUTDATED+=("$ref: newer image in registry")
+	done < <(dc config --images 2>/dev/null | sort -u)
+}
+
+join_by() {
+	local sep="$1" out="$2"
+	shift 2
+	for item in "$@"; do
+		out+="$sep$item"
+	done
+	echo "$out"
+}
+
+process_project() {
+	local dir="$1" file="$2" name
+	CUR_FARG="$3"
+	CUR_NOTE=""
+	name="$(basename "$dir")"
+
+	echo
+	echo -ne "Working on ${FC_LIGHT_BLUE}$name${FC_DEFAULT}: "
+
+	cd "$dir" || {
+		echo -e "${FC_LIGHT_RED}ERROR: ${FC_DEFAULT}can't change to service directory $dir" >&2
+		record "$name" failed "can't change to $dir"
+		return
+	}
+
+	# Read the setting from the merged config, so overrides, includes and .env apply.
+	local config enabled
+	config="$(dc config 2>&1)" || {
+		echo -e "${FC_LIGHT_RED}ERROR: ${FC_DEFAULT}docker compose config failed for $name" >&2
+		record "$name" failed "compose config failed: $(head -n 1 <<<"$config")"
+		return
+	}
+	enabled="$(yq '.["x-docker-updater"].enabled' <<<"$config")"
+	if [[ "$enabled" == false ]]; then
+		echo -e "${FC_RED}autoupdate disabled for ${FC_LIGHT_BLUE}$name${FC_DEFAULT}"
+		record "$name" skipped "disabled in x-docker-updater"
+		return
+	elif [[ "$enabled" != true ]]; then
+		# Deprecated: the old way to enable it, configs.autoupdate in the compose file itself.
+		if <"$file" yq .configs.autoupdate -e >/dev/null 2>&1; then
+			CUR_NOTE="deprecated configs.autoupdate, use x-docker-updater.enabled"
+		else
+			echo -e "${FC_RED}autoupdate not configured for ${FC_LIGHT_BLUE}$name${FC_DEFAULT}"
+			record "$name" skipped "autoupdate not configured"
+			return
+		fi
+	fi
+
+	if ((DRY_RUN)); then
+		echo -e "${FC_GREEN}checking for updates${FC_DEFAULT}"
+		local_changes || {
+			record "$name" failed "${CHANGES[0]}"
+			return
+		}
+		remote_changes
+		local reasons=("${CHANGES[@]}" "${OUTDATED[@]}")
+		if ((${#reasons[@]})); then
+			record "$name" "would update" "$(join_by "; " "${reasons[@]}" "${UNCHECKED[@]}")"
+		elif ((${#UNCHECKED[@]})); then
+			record "$name" unknown "$(join_by "; " "${UNCHECKED[@]}")"
+		else
+			record "$name" up-to-date "all images current"
+		fi
+		return
+	fi
+
+	echo -e "${FC_GREEN}trying to pull${FC_DEFAULT}"
+	dc pull --ignore-buildable || {
+		record "$name" failed "pull failed, service not restarted"
+		return
+	}
+
+	echo -e "${FC_GREEN}trying build${FC_DEFAULT}"
+	dc build --pull || {
+		record "$name" failed "build failed, service not restarted"
+		return
+	}
+
+	local_changes || {
+		record "$name" failed "${CHANGES[0]}"
+		return
+	}
+	if ((!${#CHANGES[@]})); then
+		echo -e "${FC_GREEN}nothing changed, not restarting${FC_DEFAULT}"
+		record "$name" up-to-date "no new images"
+		return
+	fi
+
+	echo -e "${FC_GREEN}starting changed services (up -d --remove-orphans)${FC_DEFAULT}"
+	dc up -d --remove-orphans || {
+		record "$name" failed "up -d failed after: $(join_by "; " "${CHANGES[@]}")"
+		return
+	}
+	record "$name" updated "$(join_by "; " "${CHANGES[@]}")"
+}
+
+PRUNE_NOTES=()
+
+prune() {
+	echo
+	if ((DRY_RUN)); then
+		echo -e "${FC_YELLOW}dry run: would clean up $1 (docker system prune -af)${FC_DEFAULT}"
+		return
+	fi
+	echo -e "${FC_GREEN}cleaning up $1 (docker system prune -af)${FC_DEFAULT}"
+	docker system prune -af || {
+		PRUNE_NOTES+=("prune $1 failed")
+		FAILED=1
+	}
+}
+
+HAVE_BUILDX=0
+((DRY_RUN)) && docker buildx version &>/dev/null && HAVE_BUILDX=1
+
+((${#P_DIR[@]})) && prune before
+for i in "${!P_DIR[@]}"; do
+	process_project "${P_DIR[$i]}" "${P_FILE[$i]}" "${P_FARG[$i]}"
+done
+((${#P_DIR[@]})) && prune after
+
+echo
+echo -e "${S_BOLD}Summary${R_ALL}$( ((DRY_RUN)) && echo " (dry run)")"
+width=4
+for name in "${RES_NAME[@]}"; do
+	((${#name} > width)) && width=${#name}
+done
+for i in "${!RES_NAME[@]}"; do
+	case "${RES_STATUS[$i]}" in
+	updated) color="$FC_LIGHT_CYAN" ;;
+	"would update") color="$FC_LIGHT_YELLOW" ;;
+	up-to-date) color="$FC_GREEN" ;;
+	skipped) color="$FC_DARK_GRAY" ;;
+	unknown) color="$FC_MAGENTA" ;;
+	*) color="$FC_LIGHT_RED" ;;
+	esac
+	printf "  %-${width}s  %b%-12s%b  %s\n" "${RES_NAME[$i]}" "$color" "${RES_STATUS[$i]}" "$FC_DEFAULT" "${RES_REASON[$i]}"
+done
+((${#RES_NAME[@]})) || echo "  no compose projects found"
+for note in "${PRUNE_NOTES[@]}"; do
+	echo -e "  ${FC_LIGHT_RED}$note${FC_DEFAULT}"
+done
+
+exit "$FAILED"
